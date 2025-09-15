@@ -1,73 +1,59 @@
 from flask import Flask, request, Response
-import escpos.printer as printer
-from escpos import exceptions as escpos_exceptions
-import usb.core
+import base64
+import xml.etree.ElementTree as ET
+from PIL import Image
+import numpy as np
 
 # output network de odoo
 # https://192.168.18.101/cgi-bin/epos/service.cgi?devid=local_printer 
 app = Flask(__name__)
 
-# cambiar esto al puerto del a impresora
-PIRNTER_PORT = "lmao"
+@app.route('/cgi-bin/epos/service.cgi', methods=['POST'])
 
-# buscar la impresora
-def find_jaltech_printer():
-    common_escpos_devices = [
-        {'vendor_id': 0x0416, 'product_id': 0x5011},  # Ejemplo genérico 1
-        {'vendor_id': 0x1504, 'product_id': 0x0006},  # Ejemplo genérico 2
-        {'vendor_id': 0x0483, 'product_id': 0x5740},  # Ejemplo genérico 3
-    ]
-
-    for device_info in common_escpos_devices:
-        dev = usb.core.find(idVendor=device_info['vendor_id'], idPorduct=device_info['product_id'])
-        if dev is not None:
-            print(f"¡Impresora encontrada! Vendor ID: {device_info['vendor_id']:04x}, Product ID: {device_info['product_id']:04x}")
-            try:
-                # Intentar crear una instancia de la impresora con los IDs encontrados
-                usb_printer = printer.Usb(device_info['vendor_id'], device_info['product_id'])
-                print("Conexión establecida con la impresora.")
-                return usb_printer
-            except escpos_exceptions.USBNotFoundError:
-                print("Se encontró el dispositivo USB, pero no se pudo inicializar como impresora.")
-                continue
-        return None
-
-jaltech_printer = find_jaltech_printer()
-
-@app.route('/print-receipt', methods=['POST'])
 def print_receipt():
-    if jaltech_printer is None:
-        return Response("Error: Verificar USB", status=500)
+    # get raw data from odoo
+    xml_data = request.data.decode('utf-8', errors='ignore')
+    root = ET.fromstring(xml_data)
 
-    try:
-        # get raw data from odoo
-        escpos_data = request.data
+    # Define namespaces from the XML
+    ns = {
+        "s": "http://schemas.xmlsoap.org/soap/envelope/",
+        "epos": "http://www.epson-pos.com/schemas/2011/03/epos-print"
+    }
 
-        # print raw
-        jaltech_printer._raw(escpos_data)
+    # Find <image> inside the Epson namespace
+    image_element = root.find(".//epos:image", ns)
 
-        jaltech_printer.control('LF', count=2)
-        jaltech_printer.cut()
+    if image_element is not None and image_element.text:
+        base64_data = image_element.text.strip()
+        image_bytes = base64.b64decode(base64_data)
 
-        return Response(status=200)
+        # Extract attributes for width/height
+        width = int(image_element.attrib.get("width", 384))  # default 384 px
+        height = int(image_element.attrib.get("height", len(image_bytes) * 8 // width))
 
-    
-    except escpos_exceptions.USBNotFoundError:
-        print("Error: Se perdió la conexión con la impresora USB.")
-        return Response("Error de conexión con la impresora.", status=500)
-    except Exception as e:
-        print(f"Error inesperado: {e}")
-        return Response(f"Error del servidor: {e}", status=500)
+        # Convert ESC/POS raster (1 bit/pixel) into numpy array
+        row_bytes = (width + 7) // 8  # bytes per row
+        bitmap = np.zeros((height, width), dtype=np.uint8)
+
+        for y in range(height):
+            row_start = y * row_bytes
+            row_data = image_bytes[row_start:row_start + row_bytes]
+            for x_byte, byte in enumerate(row_data):
+                for bit in range(8):
+                    x = x_byte * 8 + (7 - bit)  # MSB first
+                    if x < width:
+                        bitmap[y, x] = 0 if (byte >> bit) & 1 else 255
+
+        # Create and save image
+        img = Image.fromarray(bitmap, mode="L")
+        img.save("output.png")
+        print("✅ ESC/POS raster image saved as output.png")
+    else:
+        print("❌ No <image> tag found in XML or it was empty")
+
+    return Response(status=200)
 
 if __name__ == '__main__':
     print("Iniciando Servidor de Impresión ESC/POS para Odoo Online...")
-    if jaltech_printer:
-        print("La impresora JALTECH está conectada y lista.")
-    else:
-        print("ADVERTENCIA: No se pudo encontrar una impresora ESC/POS al inicio.")
-        print("Conecte la impresora y reinicie el script, o envíe un trabajo de prueba.")
-    # Ejecutar el servidor en el puerto 3000.
-    app.run(host='0.0.0.0', port=3000, debug=True)
-
-
-
+    app.run(host='0.0.0.0', port=5000, ssl_context=('cert.pem', 'key.pem'))
