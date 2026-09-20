@@ -6,3 +6,8 @@ itsdangerous==2.2.0
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 Werkzeug==3.1.8
+waitress==3.0.2
+# Windows-only: printing via the spooler RAW API
+pywin32==311; sys_platform == "win32"
+# Build tool (install on Windows to produce the .exe)
+pyinstaller==6.16.0

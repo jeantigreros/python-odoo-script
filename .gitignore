@@ -1,4 +1,10 @@
 venv/
+.venv/
 *.pem
-__pycache__/ 
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.spec.lock
+
 

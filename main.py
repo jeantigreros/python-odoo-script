@@ -1,26 +1,44 @@
 from flask import Flask, request, Response
+from waitress import serve
 from flask_cors import CORS
 import base64
 import binascii
 import html
 import logging
+import multiprocessing
 import os
 import threading
 import xml.etree.ElementTree as ET
 
-import win32print
+try:
+    import win32print
+except ImportError:  # Linux/CI: allow import; print_raw() raises a clear error.
+    win32print = None  # type: ignore[assignment]
 
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
 
-HOST = "0.0.0.0"
+HOST = "127.0.0.1"
 PORT = 5000
 
 # Better to explicitly configure the Windows printer queue.
 # Falls back to the Windows default printer if not defined.
-PRINTER_NAME = os.getenv("POS_PRINTER_NAME") or win32print.GetDefaultPrinter()
+def _default_printer_name():
+    for env_key in ("POS_PRINTER_NAME", "POS-80"):
+        value = os.getenv(env_key)
+        if value:
+            return value
+    if win32print is not None:
+        try:
+            return win32print.GetDefaultPrinter()
+        except Exception:
+            pass
+    return "POS-80"
+
+
+PRINTER_NAME = _default_printer_name()
 
 # Set this to the printable width of your POS-80.
 #
@@ -394,6 +412,12 @@ def print_raw(data):
     if not data:
         raise ValueError("No printer data")
 
+    if win32print is None:
+        raise RuntimeError(
+            "win32print is not available. "
+            "This bridge must run on Windows (pywin32 installed)."
+        )
+
     with printer_lock:
 
         hprinter = None
@@ -604,27 +628,23 @@ def epos_service():
 
 
 # ------------------------------------------------------------
-# Main
+# Main (PyInstaller / Windows .exe ready)
 # ------------------------------------------------------------
 
+def main():
+    logger.info("Starting Odoo ePOS -> ESC/POS bridge")
+    logger.info("Printer: %s", PRINTER_NAME)
+    logger.info("Printer width: %d dots", PRINTER_WIDTH_DOTS)
+    logger.info("Listening on http://%s:%d", HOST, PORT)
+    logger.info("ePOS endpoint: /cgi-bin/epos/service.cgi")
+
+    # Production WSGI server. Required on Windows because Flask's
+    # built-in server is not suitable for production and because
+    # a frozen .exe must not use the reloader/debugger.
+    serve(app, host=HOST, port=PORT, threads=8)
+
+
 if __name__ == "__main__":
-
-    logger.info(
-        "Starting Odoo ePOS → ESC/POS bridge"
-    )
-
-    logger.info(
-        "Printer: %s",
-        PRINTER_NAME,
-    )
-
-    logger.info(
-        "Printer width: %d dots",
-        PRINTER_WIDTH_DOTS,
-    )
-
-    app.run(
-        host=HOST,
-        port=PORT,
-        debug=False,
-    )
+    # Required for a frozen Windows .exe (multiprocessing support).
+    multiprocessing.freeze_support()
+    main()
