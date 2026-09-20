@@ -23,39 +23,82 @@ except ImportError:  # Linux/CI: allow import; print_raw() raises a clear error.
 HOST = "127.0.0.1"
 PORT = 5000
 
-# Better to explicitly configure the Windows printer queue.
-# Falls back to the Windows default printer if not defined.
+
 def _default_printer_name():
     for env_key in ("POS_PRINTER_NAME", "POS-80"):
         value = os.getenv(env_key)
         if value:
             return value
+
     if win32print is not None:
         try:
             return win32print.GetDefaultPrinter()
         except Exception:
             pass
+
     return "POS-80"
 
 
 PRINTER_NAME = _default_printer_name()
 
-# Set this to the printable width of your POS-80.
-#
+
+# ------------------------------------------------------------
+# Printer configuration
+# ------------------------------------------------------------
+
 # Typical values:
+#
 #   384 -> ~58 mm class printers
 #   576 -> ~80 mm class printers
 #
-# Verify this against your actual POS-80.
 PRINTER_WIDTH_DOTS = int(
     os.getenv("POS_PRINTER_WIDTH_DOTS", "576")
 )
 
+
 # Odoo sends align="center".
 CENTER_IMAGES = True
 
-# Serialize access to the Windows printer queue.
-# Useful if two requests arrive at nearly the same time.
+
+# ------------------------------------------------------------
+# Receipt scaling
+# ------------------------------------------------------------
+
+# IMPORTANT:
+#
+# The Odoo receipt arrives as a bitmap.
+#
+# We keep the horizontal size at 100% so it does not exceed
+# the 576-dot printer width.
+#
+# We enlarge ONLY vertically.
+#
+# 1.00 = original height
+# 1.10 = 10% taller
+# 1.20 = 20% taller
+# 1.30 = 30% taller
+#
+# Default: 1.20
+#
+RASTER_SCALE_X = float(
+    os.getenv("POS_RASTER_SCALE_X", "1.0")
+)
+
+RASTER_SCALE_Y = float(
+    os.getenv("POS_RASTER_SCALE_Y", "1.50")
+)
+
+
+# Number of blank lines before cutting.
+END_BLANK_LINES = int(
+    os.getenv("POS_END_BLANK_LINES", "2")
+)
+
+
+# ------------------------------------------------------------
+# Printer locking
+# ------------------------------------------------------------
+
 printer_lock = threading.Lock()
 
 
@@ -65,12 +108,11 @@ printer_lock = threading.Lock()
 
 app = Flask(__name__)
 
-# Development configuration.
-# In production, restrict this to your Odoo origin.
 CORS(app)
 
 
 logger = logging.getLogger(__name__)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -81,8 +123,13 @@ logging.basicConfig(
 # ePOS XML helpers
 # ------------------------------------------------------------
 
-EPOS_NS = "http://www.epson-pos.com/schemas/2011/03/epos-print"
-SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+EPOS_NS = (
+    "http://www.epson-pos.com/schemas/2011/03/epos-print"
+)
+
+SOAP_NS = (
+    "http://schemas.xmlsoap.org/soap/envelope/"
+)
 
 
 def local_name(element):
@@ -92,6 +139,7 @@ def local_name(element):
     Example:
         {namespace}image -> image
     """
+
     return element.tag.rsplit("}", 1)[-1]
 
 
@@ -99,6 +147,7 @@ def find_element(root, name):
     """
     Find first element by local XML name.
     """
+
     for element in root.iter():
         if local_name(element) == name:
             return element
@@ -110,6 +159,7 @@ def find_elements(root, name):
     """
     Find all elements by local XML name.
     """
+
     return [
         element
         for element in root.iter()
@@ -124,14 +174,22 @@ def find_elements(root, name):
 def create_response(success=True, code="0"):
     """
     Odoo 18 expects:
+
         <response success="true" code="0"/>
 
     wrapped in the ePOS SOAP structure.
     """
 
-    success_value = "true" if success else "false"
+    success_value = (
+        "true"
+        if success
+        else "false"
+    )
 
-    code = html.escape(str(code), quote=True)
+    code = html.escape(
+        str(code),
+        quote=True,
+    )
 
     response_xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="{SOAP_NS}">
@@ -160,89 +218,286 @@ def extract_raster(root):
         alignment
     """
 
-    image = find_element(root, "image")
+    image = find_element(
+        root,
+        "image",
+    )
 
     if image is None:
-        raise ValueError("No <image> element found")
+        raise ValueError(
+            "No <image> element found"
+        )
 
     if not image.text:
-        raise ValueError("The <image> element is empty")
+        raise ValueError(
+            "The <image> element is empty"
+        )
 
     try:
         raster = base64.b64decode(
             "".join(image.text.split()),
             validate=True,
         )
+
     except binascii.Error as exc:
         raise ValueError(
             "Invalid base64 raster data"
         ) from exc
 
     try:
-        width = int(image.attrib["width"])
-        height = int(image.attrib["height"])
+        width = int(
+            image.attrib["width"]
+        )
+
+        height = int(
+            image.attrib["height"]
+        )
+
     except (KeyError, ValueError) as exc:
         raise ValueError(
             "Invalid image width/height"
         ) from exc
 
-    alignment = image.attrib.get("align", "left")
+    alignment = image.attrib.get(
+        "align",
+        "left",
+    )
 
     if width <= 0 or height <= 0:
-        raise ValueError("Invalid image dimensions")
+        raise ValueError(
+            "Invalid image dimensions"
+        )
 
-    source_row_bytes = (width + 7) // 8
+    source_row_bytes = (
+        width + 7
+    ) // 8
 
-    expected_size = source_row_bytes * height
+    expected_size = (
+        source_row_bytes * height
+    )
 
     if len(raster) != expected_size:
         raise ValueError(
             f"Raster size mismatch: "
-            f"expected {expected_size}, got {len(raster)}"
+            f"expected {expected_size}, "
+            f"got {len(raster)}"
         )
 
-    return width, height, raster, alignment
+    return (
+        width,
+        height,
+        raster,
+        alignment,
+    )
 
 
 # ------------------------------------------------------------
-# Raster conversion
+# Raster scaling
 # ------------------------------------------------------------
 
-def add_left_padding(raster, width, height, padding_pixels):
+def scale_raster(
+    raster,
+    width,
+    height,
+    scale_x,
+    scale_y,
+):
     """
-    Add horizontal white padding to each raster row.
+    Scale a 1-bit MSB-first raster.
 
-    This lets us emulate Odoo's align="center" behavior.
+    Horizontal scaling is normally kept at 1.0.
 
-    Returns:
-        padded_raster
-        new_width
+    Vertical scaling can be increased to make the
+    receipt text taller without exceeding the printer
+    width.
+
+    Example:
+
+        scale_x = 1.0
+        scale_y = 1.2
+
+    keeps the same width and makes the receipt 20% taller.
+    """
+
+    if scale_x <= 0:
+        raise ValueError(
+            "RASTER_SCALE_X must be greater than 0"
+        )
+
+    if scale_y <= 0:
+        raise ValueError(
+            "RASTER_SCALE_Y must be greater than 0"
+        )
+
+    if (
+        scale_x == 1.0
+        and scale_y == 1.0
+    ):
+        return (
+            raster,
+            width,
+            height,
+        )
+
+    source_row_bytes = (
+        width + 7
+    ) // 8
+
+    # Calculate new dimensions.
+    new_width = int(
+        width * scale_x
+    )
+
+    new_height = int(
+        height * scale_y
+    )
+
+    if new_width <= 0 or new_height <= 0:
+        raise ValueError(
+            "Scaled raster dimensions are invalid"
+        )
+
+    # ESC/POS raster data is byte based.
+    # Round width up to nearest 8 pixels.
+    new_width = (
+        (new_width + 7) // 8
+    ) * 8
+
+    new_row_bytes = (
+        new_width // 8
+    )
+
+    output = bytearray(
+        new_row_bytes * new_height
+    )
+
+    def get_pixel(x, y):
+        byte_index = (
+            y * source_row_bytes
+            + (x // 8)
+        )
+
+        bit_index = (
+            7 - (x % 8)
+        )
+
+        return (
+            raster[byte_index]
+            >> bit_index
+        ) & 1
+
+    def set_pixel(x, y):
+        byte_index = (
+            y * new_row_bytes
+            + (x // 8)
+        )
+
+        bit_index = (
+            7 - (x % 8)
+        )
+
+        output[byte_index] |= (
+            1 << bit_index
+        )
+
+    for new_y in range(new_height):
+
+        source_y = min(
+            int(new_y / scale_y),
+            height - 1,
+        )
+
+        for new_x in range(new_width):
+
+            source_x = min(
+                int(new_x / scale_x),
+                width - 1,
+            )
+
+            if get_pixel(
+                source_x,
+                source_y,
+            ):
+                set_pixel(
+                    new_x,
+                    new_y,
+                )
+
+    return (
+        bytes(output),
+        new_width,
+        new_height,
+    )
+
+
+# ------------------------------------------------------------
+# Raster centering
+# ------------------------------------------------------------
+
+def add_left_padding(
+    raster,
+    width,
+    height,
+    padding_pixels,
+):
+    """
+    Add horizontal white padding to each
+    raster row.
+
+    This lets us emulate Odoo's
+    align="center" behavior.
     """
 
     if padding_pixels <= 0:
-        return raster, width
+        return (
+            raster,
+            width,
+        )
 
     if padding_pixels % 8 != 0:
-        raise ValueError("Padding must be a multiple of 8 pixels")
+        raise ValueError(
+            "Padding must be a multiple of 8 pixels"
+        )
 
-    source_row_bytes = (width + 7) // 8
-    padding_bytes = b"\x00" * (padding_pixels // 8)
+    source_row_bytes = (
+        width + 7
+    ) // 8
+
+    padding_bytes = (
+        b"\x00"
+        * (padding_pixels // 8)
+    )
 
     padded_rows = []
 
     for y in range(height):
-        start = y * source_row_bytes
-        end = start + source_row_bytes
 
-        row = raster[start:end]
+        start = (
+            y * source_row_bytes
+        )
+
+        end = (
+            start
+            + source_row_bytes
+        )
+
+        row = raster[
+            start:end
+        ]
 
         padded_rows.append(
             padding_bytes + row
         )
 
-    new_width = width + padding_pixels
+    new_width = (
+        width
+        + padding_pixels
+    )
 
-    return b"".join(padded_rows), new_width
+    return (
+        b"".join(padded_rows),
+        new_width,
+    )
 
 
 def prepare_raster(
@@ -252,15 +507,16 @@ def prepare_raster(
     alignment="left",
 ):
     """
-    Convert the ePOS raster into the raster we want to send
-    through ESC/POS.
+    Convert the ePOS raster into the raster
+    we want to send through ESC/POS.
 
     Odoo normally sends align="center".
     """
 
     if width > PRINTER_WIDTH_DOTS:
         raise ValueError(
-            f"Receipt width {width}px exceeds printer width "
+            f"Receipt width {width}px "
+            f"exceeds printer width "
             f"{PRINTER_WIDTH_DOTS}px"
         )
 
@@ -274,52 +530,83 @@ def prepare_raster(
             "Source image width must be divisible by 8"
         )
 
-    if alignment == "center" and CENTER_IMAGES:
-        remaining = PRINTER_WIDTH_DOTS - width
+    if (
+        alignment == "center"
+        and CENTER_IMAGES
+    ):
 
-        left_padding = remaining // 2
-
-        # Raster commands work in whole bytes.
-        left_padding -= left_padding % 8
-
-        raster, width = add_left_padding(
-            raster,
-            width,
-            height,
-            left_padding,
+        remaining = (
+            PRINTER_WIDTH_DOTS
+            - width
         )
 
-        # Pad the right side so the final raster width is exactly
-        # PRINTER_WIDTH_DOTS.
+        left_padding = (
+            remaining // 2
+        )
 
-        right_padding = PRINTER_WIDTH_DOTS - width
+        # Raster commands work in whole bytes.
+        left_padding -= (
+            left_padding % 8
+        )
 
-        if right_padding:
-            raster, width = add_left_padding(
+        raster, width = (
+            add_left_padding(
                 raster,
                 width,
                 height,
-                0,
+                left_padding,
+            )
+        )
+
+        # Pad right side so final raster
+        # is exactly printer width.
+
+        right_padding = (
+            PRINTER_WIDTH_DOTS
+            - width
+        )
+
+        if right_padding:
+
+            row_bytes = (
+                width // 8
             )
 
-            row_bytes = width // 8
-            right_bytes = right_padding // 8
+            right_bytes = (
+                right_padding // 8
+            )
 
             rows = []
 
             for y in range(height):
-                start = y * row_bytes
-                end = start + row_bytes
 
-                rows.append(
-                    raster[start:end] +
-                    b"\x00" * right_bytes
+                start = (
+                    y * row_bytes
                 )
 
-            raster = b"".join(rows)
-            width = PRINTER_WIDTH_DOTS
+                end = (
+                    start
+                    + row_bytes
+                )
 
-    return raster, width
+                rows.append(
+                    raster[start:end]
+                    + b"\x00"
+                    * right_bytes
+                )
+
+            raster = b"".join(
+                rows
+            )
+
+            width = (
+                PRINTER_WIDTH_DOTS
+            )
+
+    return (
+        raster,
+        width,
+    )
 
 
 # ------------------------------------------------------------
@@ -338,24 +625,34 @@ def build_raster_command(
 
     using normal density.
 
-    The ePOS raster is already MSB-first, one bit per pixel,
-    which maps naturally to ESC/POS raster data.
+    The ePOS raster is already MSB-first,
+    one bit per pixel, which maps naturally
+    to ESC/POS raster data.
     """
 
-    width_bytes = (width + 7) // 8
+    width_bytes = (
+        width + 7
+    ) // 8
 
     if width_bytes > 0xFFFF:
-        raise ValueError("Image is too wide")
+        raise ValueError(
+            "Image is too wide"
+        )
 
     if height > 0xFFFF:
-        raise ValueError("Image is too tall")
+        raise ValueError(
+            "Image is too tall"
+        )
 
-    expected_size = width_bytes * height
+    expected_size = (
+        width_bytes * height
+    )
 
     if len(raster) != expected_size:
         raise ValueError(
             f"ESC/POS raster size mismatch: "
-            f"expected {expected_size}, got {len(raster)}"
+            f"expected {expected_size}, "
+            f"got {len(raster)}"
         )
 
     command = bytes(
@@ -366,14 +663,21 @@ def build_raster_command(
             0x00,  # normal density
 
             width_bytes & 0xFF,
-            (width_bytes >> 8) & 0xFF,
+            (
+                width_bytes >> 8
+            ) & 0xFF,
 
             height & 0xFF,
-            (height >> 8) & 0xFF,
+            (
+                height >> 8
+            ) & 0xFF,
         ]
     )
 
-    return command + raster
+    return (
+        command
+        + raster
+    )
 
 
 def build_cut_command():
@@ -381,9 +685,11 @@ def build_cut_command():
     Full cut.
 
     Your current POS-80 command was:
+
         GS V 0
 
-    Keep that initially because you already know it works.
+    Keep that because you already
+    know it works.
     """
 
     return b"\x1D\x56\x00"
@@ -394,10 +700,15 @@ def build_cash_drawer_command():
     ESC p 0 25 250
 
     Typical cash drawer pulse.
-    Verify against the POS-80 if you use a drawer.
     """
 
-    return b"\x1B\x70\x00\x19\xFA"
+    return (
+        b"\x1B"
+        b"\x70"
+        b"\x00"
+        b"\x19"
+        b"\xFA"
+    )
 
 
 # ------------------------------------------------------------
@@ -406,16 +717,20 @@ def build_cash_drawer_command():
 
 def print_raw(data):
     """
-    Send printer-ready bytes directly to the Windows spooler.
+    Send printer-ready bytes directly
+    to the Windows spooler.
     """
 
     if not data:
-        raise ValueError("No printer data")
+        raise ValueError(
+            "No printer data"
+        )
 
     if win32print is None:
         raise RuntimeError(
             "win32print is not available. "
-            "This bridge must run on Windows (pywin32 installed)."
+            "This bridge must run on Windows "
+            "(pywin32 installed)."
         )
 
     with printer_lock:
@@ -423,13 +738,16 @@ def print_raw(data):
         hprinter = None
 
         try:
+
             logger.info(
                 "Opening printer: %s",
                 PRINTER_NAME,
             )
 
-            hprinter = win32print.OpenPrinter(
-                PRINTER_NAME
+            hprinter = (
+                win32print.OpenPrinter(
+                    PRINTER_NAME
+                )
             )
 
             win32print.StartDocPrinter(
@@ -443,14 +761,18 @@ def print_raw(data):
             )
 
             try:
+
                 win32print.StartPagePrinter(
                     hprinter
                 )
 
                 try:
-                    written = win32print.WritePrinter(
-                        hprinter,
-                        data,
+
+                    written = (
+                        win32print.WritePrinter(
+                            hprinter,
+                            data,
+                        )
                     )
 
                     if written != len(data):
@@ -460,11 +782,13 @@ def print_raw(data):
                         )
 
                 finally:
+
                     win32print.EndPagePrinter(
                         hprinter
                     )
 
             finally:
+
                 win32print.EndDocPrinter(
                     hprinter
                 )
@@ -475,6 +799,7 @@ def print_raw(data):
             )
 
         finally:
+
             if hprinter:
                 win32print.ClosePrinter(
                     hprinter
@@ -482,46 +807,115 @@ def print_raw(data):
 
 
 # ------------------------------------------------------------
-# ePOS → ESC/POS translation
+# ePOS -> ESC/POS translation
 # ------------------------------------------------------------
 
-def translate_epos_to_escpos(xml_data):
+def translate_epos_to_escpos(
+    xml_data,
+):
     """
-    Translate the subset of ePOS commands used by Odoo 18 POS.
+    Translate the subset of ePOS commands
+    used by Odoo 18 POS.
 
     Current Odoo Epson POS flow:
+
         <image ...>
         <cut .../>
 
     Cash drawer:
+
         <pulse/>
     """
 
-    root = ET.fromstring(xml_data)
+    root = ET.fromstring(
+        xml_data
+    )
 
     printer_data = bytearray()
 
-    image = find_element(root, "image")
+    # --------------------------------------------------------
+    # IMAGE
+    # --------------------------------------------------------
+
+    image = find_element(
+        root,
+        "image",
+    )
 
     if image is not None:
 
-        width, height, raster, alignment = extract_raster(
-            root
+        width, height, raster, alignment = (
+            extract_raster(root)
         )
 
         logger.info(
-            "Received raster: %dx%d, align=%s, %d bytes",
+            "Received raster: %dx%d, "
+            "align=%s, %d bytes",
             width,
             height,
             alignment,
             len(raster),
         )
 
-        raster, final_width = prepare_raster(
-            raster,
-            width,
-            height,
-            alignment,
+        # ----------------------------------------------------
+        # Scale the raster.
+        #
+        # X stays at 1.0 by default.
+        # Y is 1.20 by default.
+        #
+        # This makes text taller without making the receipt
+        # wider than the printer.
+        # ----------------------------------------------------
+
+        if (
+            RASTER_SCALE_X != 1.0
+            or RASTER_SCALE_Y != 1.0
+        ):
+
+            logger.info(
+                "Scaling raster X=%.2fx Y=%.2fx",
+                RASTER_SCALE_X,
+                RASTER_SCALE_Y,
+            )
+
+            raster, width, height = (
+                scale_raster(
+                    raster,
+                    width,
+                    height,
+                    RASTER_SCALE_X,
+                    RASTER_SCALE_Y,
+                )
+            )
+
+            logger.info(
+                "Scaled raster: %dx%d",
+                width,
+                height,
+            )
+
+        # ----------------------------------------------------
+        # Make sure width still fits.
+        # ----------------------------------------------------
+
+        if width > PRINTER_WIDTH_DOTS:
+            raise ValueError(
+                f"Scaled receipt width "
+                f"{width}px exceeds printer "
+                f"width {PRINTER_WIDTH_DOTS}px"
+            )
+
+        # ----------------------------------------------------
+        # Center the receipt.
+        # ----------------------------------------------------
+
+        raster, final_width = (
+            prepare_raster(
+                raster,
+                width,
+                height,
+                alignment,
+            )
         )
 
         printer_data.extend(
@@ -532,18 +926,51 @@ def translate_epos_to_escpos(xml_data):
             )
         )
 
-    # Odoo's openCashbox() sends <pulse/>.
-    pulse = find_element(root, "pulse")
+    # --------------------------------------------------------
+    # CASH DRAWER
+    # --------------------------------------------------------
+
+    pulse = find_element(
+        root,
+        "pulse",
+    )
 
     if pulse is not None:
+
+        logger.info(
+            "Cash drawer pulse requested"
+        )
+
         printer_data.extend(
             build_cash_drawer_command()
         )
 
-    # Respect an explicit cut command.
-    cut = find_element(root, "cut")
+    # --------------------------------------------------------
+    # CUT
+    # --------------------------------------------------------
+
+    cut = find_element(
+        root,
+        "cut",
+    )
 
     if cut is not None:
+
+        logger.info(
+            "Cut requested; adding %d blank lines",
+            END_BLANK_LINES,
+        )
+
+        # Two blank lines by default.
+        #
+        # ESC/POS LF = 0x0A
+        if END_BLANK_LINES > 0:
+
+            printer_data.extend(
+                b"\x0A"
+                * END_BLANK_LINES
+            )
+
         printer_data.extend(
             build_cut_command()
         )
@@ -553,7 +980,9 @@ def translate_epos_to_escpos(xml_data):
             "No supported ePOS print command found"
         )
 
-    return bytes(printer_data)
+    return bytes(
+        printer_data
+    )
 
 
 # ------------------------------------------------------------
@@ -579,8 +1008,10 @@ def epos_service():
             len(xml_data),
         )
 
-        escpos_data = translate_epos_to_escpos(
-            xml_data
+        escpos_data = (
+            translate_epos_to_escpos(
+                xml_data
+            )
         )
 
         print_raw(
@@ -596,7 +1027,7 @@ def epos_service():
             mimetype="text/xml",
         )
 
-    except ET.ParseError as exc:
+    except ET.ParseError:
 
         logger.exception(
             "Invalid XML"
@@ -611,7 +1042,7 @@ def epos_service():
             mimetype="text/xml",
         )
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Printing failed"
@@ -628,23 +1059,61 @@ def epos_service():
 
 
 # ------------------------------------------------------------
-# Main (PyInstaller / Windows .exe ready)
+# Main
 # ------------------------------------------------------------
 
 def main():
-    logger.info("Starting Odoo ePOS -> ESC/POS bridge")
-    logger.info("Printer: %s", PRINTER_NAME)
-    logger.info("Printer width: %d dots", PRINTER_WIDTH_DOTS)
-    logger.info("Listening on http://%s:%d", HOST, PORT)
-    logger.info("ePOS endpoint: /cgi-bin/epos/service.cgi")
 
-    # Production WSGI server. Required on Windows because Flask's
-    # built-in server is not suitable for production and because
-    # a frozen .exe must not use the reloader/debugger.
-    serve(app, host=HOST, port=PORT, threads=8)
+    logger.info(
+        "Starting Odoo ePOS -> ESC/POS bridge"
+    )
+
+    logger.info(
+        "Printer: %s",
+        PRINTER_NAME,
+    )
+
+    logger.info(
+        "Printer width: %d dots",
+        PRINTER_WIDTH_DOTS,
+    )
+
+    logger.info(
+        "Raster scale X: %.2fx",
+        RASTER_SCALE_X,
+    )
+
+    logger.info(
+        "Raster scale Y: %.2fx",
+        RASTER_SCALE_Y,
+    )
+
+    logger.info(
+        "End blank lines: %d",
+        END_BLANK_LINES,
+    )
+
+    logger.info(
+        "Listening on http://%s:%d",
+        HOST,
+        PORT,
+    )
+
+    logger.info(
+        "ePOS endpoint: "
+        "/cgi-bin/epos/service.cgi"
+    )
+
+    serve(
+        app,
+        host=HOST,
+        port=PORT,
+        threads=8,
+    )
 
 
 if __name__ == "__main__":
-    # Required for a frozen Windows .exe (multiprocessing support).
+
     multiprocessing.freeze_support()
+
     main()
