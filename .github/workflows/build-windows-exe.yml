@@ -127,7 +127,7 @@ jobs:
           2. Extract it.
           3. Run PowerShell as Administrator.
           4. Execute:
-             .\install_windows_service.ps1 -ServiceName OdooPrinter -DisplayName "Odoo Printer"
+             .\install_windows_service.ps1
 
           The service uses NSSM to run the bundled EXE in the background.
           "@ | Out-File "$packageDir\INSTALL.txt" -Encoding ascii
