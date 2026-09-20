@@ -1,6 +1,6 @@
-# Build Windows .exe
+# Build Windows Service
 
-`main.py` is Windows `.exe` ready. 71 tests pass.
+`main.py` is ready to be packaged as a Windows service by NSSM. 71 tests pass.
 
 ## What was fixed in `main.py`
 
@@ -13,8 +13,9 @@
 
 - `main.spec` — PyInstaller one-file build → `dist\odoo-epos-bridge.exe` (console kept for logs).
 - `build_windows.bat` — double-click build script.
+- `install_windows_service.ps1` — installs the EXE as a Windows service using NSSM.
 - `requirements.txt` — added `waitress`, `pywin32; sys_platform=="win32"`, `pyinstaller`.
-- `.github/workflows/build-windows-exe.yml` — auto-builds the `.exe` on push.
+- `.github/workflows/build-windows-exe.yml` — builds a ZIP bundle with the EXE, NSSM, and installer script.
 
 ## Build on Windows
 
@@ -31,6 +32,20 @@ pip install -r requirements.txt
 pyinstaller --noconfirm main.spec
 dist\odoo-epos-bridge.exe
 ```
+
+## Install as a Windows service with NSSM
+
+From a Windows machine with Administrator rights:
+
+```powershell
+.\install_windows_service.ps1 -ServiceName OdooPrinter -DisplayName "Odoo Printer"
+```
+
+This will:
+
+- find the bundled `odoo-epos-bridge.exe`
+- install it as an NSSM-managed service
+- start the service automatically
 
 ## Configure
 

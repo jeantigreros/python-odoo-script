@@ -1,4 +1,4 @@
-name: Build and Release Windows Installer
+name: Build and Release Windows Service
 
 on:
   push:
@@ -17,25 +17,19 @@ permissions:
 
 env:
   APP_NAME: Odoo Printer
-  APP_EXE: odoo-printer.exe
+  APP_EXE: odoo-epos-bridge.exe
   SERVICE_NAME: OdooPrinter
   PYTHON_VERSION: "3.12"
 
 jobs:
   build:
-    name: Build Windows Installer
+    name: Build Windows Service Package
     runs-on: windows-latest
 
     steps:
-      # ------------------------------------------------------------
-      # Checkout
-      # ------------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # Determine version
-      # ------------------------------------------------------------
       - name: Determine version
         id: version
         shell: pwsh
@@ -53,185 +47,104 @@ jobs:
           }
 
           "VERSION=$version" >> $env:GITHUB_OUTPUT
-
           Write-Host "Building version $version"
 
-      # ------------------------------------------------------------
-      # Python
-      # ------------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      # ------------------------------------------------------------
-      # Install Python dependencies
-      # ------------------------------------------------------------
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-
           if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
+            python -m pip install -r requirements.txt
+          }
+          python -m pip install pyinstaller
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          if (Test-Path "main.spec") {
+            pyinstaller --clean --noconfirm main.spec
+          }
+          else {
+            pyinstaller --clean --noconfirm --onefile --console --name "odoo-epos-bridge" main.py
           }
 
-          pip install pyinstaller
-
-      # ------------------------------------------------------------
-      # Build PyInstaller EXE
-      # ------------------------------------------------------------
-      - name: Build EXE
-        shell: cmd
-        run: |
-          if exist main.spec (
-            pyinstaller --clean --noconfirm main.spec
-          ) else (
-            pyinstaller --clean --noconfirm --onefile --windowed --name "%APP_EXE:.exe=%" main.py
-          )
-
-      # ------------------------------------------------------------
-      # Verify EXE exists
-      # ------------------------------------------------------------
       - name: Verify EXE
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse |
-            Select-Object -First 1
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse | Select-Object -First 1
 
           if (-not $exe) {
             Write-Error "No EXE was produced in dist/"
             exit 1
           }
 
-          Write-Host "Found EXE:"
-          Write-Host $exe.FullName
+          Write-Host "Found EXE: $($exe.FullName)"
 
-      # ------------------------------------------------------------
-      # Prepare installer directory
-      # ------------------------------------------------------------
-      - name: Prepare installer files
-        shell: pwsh
-        run: |
-          $version = "${{ steps.version.outputs.VERSION }}"
-
-          New-Item -ItemType Directory -Force -Path "installer\payload" | Out-Null
-
-          # Find PyInstaller output
-          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse |
-            Select-Object -First 1
-
-          if (-not $exe) {
-            Write-Error "Could not find PyInstaller EXE"
-            exit 1
-          }
-
-          # Normalize the EXE name
-          Copy-Item $exe.FullName "installer\payload\${{ env.APP_EXE }}" -Force
-
-          # Copy additional runtime files if they exist
-          if (Test-Path "config.ini") {
-            Copy-Item "config.ini" "installer\payload\config.ini" -Force
-          }
-
-          if (Test-Path "config.example.ini") {
-            Copy-Item "config.example.ini" "installer\payload\config.example.ini" -Force
-          }
-
-          if (Test-Path "README.md") {
-            Copy-Item "README.md" "installer\payload\README.md" -Force
-          }
-
-          Write-Host "Installer payload:"
-          Get-ChildItem "installer\payload" -Recurse
-
-      # ------------------------------------------------------------
-      # Install Inno Setup
-      # ------------------------------------------------------------
-      - name: Build installer
+      - name: Prepare Windows service package
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $packageDir = "service-package"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 
-          if (-not (Test-Path $iscc)) {
-            Write-Host "Installing Inno Setup..."
-
-            winget install `
-              --id JRSoftware.InnoSetup `
-              --exact `
-              --silent `
-              --accept-package-agreements `
-              --accept-source-agreements
-          }
-
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-
-          if (-not (Test-Path $iscc)) {
-            Write-Error "Inno Setup compiler not found."
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Could not find the built EXE."
             exit 1
           }
 
-          & $iscc `
-            "/DAppVersion=$env:VERSION" `
-            "installer\OdooPrinter.iss"
+          Copy-Item $exe.FullName "$packageDir\${{ env.APP_EXE }}" -Force
+          Copy-Item "install_windows_service.ps1" "$packageDir\install_windows_service.ps1" -Force
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Inno Setup failed."
-            exit $LASTEXITCODE
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" "$packageDir\README.md" -Force
           }
 
-      # ------------------------------------------------------------
-      # Verify installer
-      # ------------------------------------------------------------
-      - name: Verify installer
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem -Path "installer\output" -Filter "*.exe" |
-            Select-Object -First 1
+          $nssmZip = Join-Path $packageDir "nssm.zip"
+          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip
 
-          if (-not $installer) {
-            Write-Error "Installer EXE was not created."
+          Expand-Archive -Path $nssmZip -DestinationPath "$packageDir\nssm" -Force
+          $nssmExe = Get-ChildItem -Path "$packageDir\nssm" -Recurse -Filter "nssm.exe" | Select-Object -First 1
+
+          if (-not $nssmExe) {
+            Write-Error "nssm.exe was not found in the downloaded archive."
             exit 1
           }
 
-          Write-Host "Installer created:"
-          Write-Host $installer.FullName
+          Copy-Item $nssmExe.FullName "$packageDir\nssm.exe" -Force
 
-      # ------------------------------------------------------------
-      # SHA256
-      # ------------------------------------------------------------
-      - name: Generate SHA256
-        id: sha256
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem -Path "installer\output" -Filter "*.exe" |
-            Select-Object -First 1
+          @"
+          Windows service package for Odoo Printer
 
-          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash
+          1. Copy the ZIP to the target Windows machine.
+          2. Extract it.
+          3. Run PowerShell as Administrator.
+          4. Execute:
+             .\install_windows_service.ps1 -ServiceName OdooPrinter -DisplayName "Odoo Printer"
 
-          "$hash  $($installer.Name)" |
-            Out-File "installer\output\SHA256SUMS.txt" -Encoding ascii
+          The service uses NSSM to run the bundled EXE in the background.
+          "@ | Out-File "$packageDir\INSTALL.txt" -Encoding ascii
 
-          Write-Host "SHA256: $hash"
+          $zipPath = "odoo-printer-windows-$env:VERSION.zip"
+          Compress-Archive -Path "$packageDir\*" -DestinationPath $zipPath -Force
 
-      # ------------------------------------------------------------
-      # Upload workflow artifact
-      # ------------------------------------------------------------
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v7
+          Write-Host "Created release bundle: $zipPath"
+
+      - name: Upload service bundle artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: OdooPrinter-Windows-${{ steps.version.outputs.VERSION }}
+          name: OdooPrinter-Windows-Service-${{ steps.version.outputs.VERSION }}
           path: |
-            installer/output/*.exe
-            installer/output/SHA256SUMS.txt
+            odoo-printer-windows-${{ steps.version.outputs.VERSION }}.zip
           if-no-files-found: error
 
-      # ------------------------------------------------------------
-      # Create GitHub Release
-      # ------------------------------------------------------------
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -239,7 +152,6 @@ jobs:
           name: Odoo Printer v${{ steps.version.outputs.VERSION }}
           generate_release_notes: true
           files: |
-            installer/output/*.exe
-            installer/output/SHA256SUMS.txt
+            odoo-printer-windows-${{ steps.version.outputs.VERSION }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
