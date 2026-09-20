@@ -1,30 +1,245 @@
-name: Build Windows EXE
+name: Build and Release Windows Installer
 
 on:
   push:
-    branches: [main, master]
+    tags:
+      - "v*"
+
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, e.g. 1.2.3"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: Odoo Printer
+  APP_EXE: odoo-printer.exe
+  SERVICE_NAME: OdooPrinter
+  PYTHON_VERSION: "3.12"
 
 jobs:
-  build-windows:
+  build:
+    name: Build Windows Installer
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # ------------------------------------------------------------
+      # Determine version
+      # ------------------------------------------------------------
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}"
+          }
+          else {
+            $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+            Write-Error "Invalid version: $version"
+            exit 1
+          }
+
+          "VERSION=$version" >> $env:GITHUB_OUTPUT
+
+          Write-Host "Building version $version"
+
+      # ------------------------------------------------------------
+      # Python
+      # ------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
+      # ------------------------------------------------------------
+      # Install Python dependencies
+      # ------------------------------------------------------------
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
 
-      - name: Build EXE with PyInstaller
-        run: pyinstaller --noconfirm main.spec
+          if (Test-Path "requirements.txt") {
+            pip install -r requirements.txt
+          }
 
-      - name: Upload EXE artifact
-        uses: actions/upload-artifact@v4
+          pip install pyinstaller
+
+      # ------------------------------------------------------------
+      # Build PyInstaller EXE
+      # ------------------------------------------------------------
+      - name: Build EXE
+        shell: cmd
+        run: |
+          if exist main.spec (
+            pyinstaller --clean --noconfirm main.spec
+          ) else (
+            pyinstaller --clean --noconfirm --onefile --windowed --name "%APP_EXE:.exe=%" main.py
+          )
+
+      # ------------------------------------------------------------
+      # Verify EXE exists
+      # ------------------------------------------------------------
+      - name: Verify EXE
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Error "No EXE was produced in dist/"
+            exit 1
+          }
+
+          Write-Host "Found EXE:"
+          Write-Host $exe.FullName
+
+      # ------------------------------------------------------------
+      # Prepare installer directory
+      # ------------------------------------------------------------
+      - name: Prepare installer files
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+
+          New-Item -ItemType Directory -Force -Path "installer\payload" | Out-Null
+
+          # Find PyInstaller output
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Error "Could not find PyInstaller EXE"
+            exit 1
+          }
+
+          # Normalize the EXE name
+          Copy-Item $exe.FullName "installer\payload\${{ env.APP_EXE }}" -Force
+
+          # Copy additional runtime files if they exist
+          if (Test-Path "config.ini") {
+            Copy-Item "config.ini" "installer\payload\config.ini" -Force
+          }
+
+          if (Test-Path "config.example.ini") {
+            Copy-Item "config.example.ini" "installer\payload\config.example.ini" -Force
+          }
+
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" "installer\payload\README.md" -Force
+          }
+
+          Write-Host "Installer payload:"
+          Get-ChildItem "installer\payload" -Recurse
+
+      # ------------------------------------------------------------
+      # Install Inno Setup
+      # ------------------------------------------------------------
+      - name: Build installer
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Installing Inno Setup..."
+
+            winget install `
+              --id JRSoftware.InnoSetup `
+              --exact `
+              --silent `
+              --accept-package-agreements `
+              --accept-source-agreements
+          }
+
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+
+          if (-not (Test-Path $iscc)) {
+            Write-Error "Inno Setup compiler not found."
+            exit 1
+          }
+
+          & $iscc `
+            "/DAppVersion=$env:VERSION" `
+            "installer\OdooPrinter.iss"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Inno Setup failed."
+            exit $LASTEXITCODE
+          }
+
+      # ------------------------------------------------------------
+      # Verify installer
+      # ------------------------------------------------------------
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path "installer\output" -Filter "*.exe" |
+            Select-Object -First 1
+
+          if (-not $installer) {
+            Write-Error "Installer EXE was not created."
+            exit 1
+          }
+
+          Write-Host "Installer created:"
+          Write-Host $installer.FullName
+
+      # ------------------------------------------------------------
+      # SHA256
+      # ------------------------------------------------------------
+      - name: Generate SHA256
+        id: sha256
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path "installer\output" -Filter "*.exe" |
+            Select-Object -First 1
+
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash
+
+          "$hash  $($installer.Name)" |
+            Out-File "installer\output\SHA256SUMS.txt" -Encoding ascii
+
+          Write-Host "SHA256: $hash"
+
+      # ------------------------------------------------------------
+      # Upload workflow artifact
+      # ------------------------------------------------------------
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: odoo-epos-bridge-windows
-          path: dist/odoo-epos-bridge.exe
+          name: OdooPrinter-Windows-${{ steps.version.outputs.VERSION }}
+          path: |
+            installer/output/*.exe
+            installer/output/SHA256SUMS.txt
+          if-no-files-found: error
+
+      # ------------------------------------------------------------
+      # Create GitHub Release
+      # ------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: Odoo Printer v${{ steps.version.outputs.VERSION }}
+          generate_release_notes: true
+          files: |
+            installer/output/*.exe
+            installer/output/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
