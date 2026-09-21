@@ -20,7 +20,7 @@ except ImportError:  # Linux/CI: allow import; print_raw() raises a clear error.
 # Configuration
 # ------------------------------------------------------------
 
-HOST = "127.0.0.1"
+HOST = "192.168.18.92"
 PORT = 5000
 
 
