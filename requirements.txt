@@ -18,6 +18,7 @@ pyinstaller-hooks-contrib==2026.7
 pytest==9.1.1
 pywin32==312
 pywin32-ctypes==0.2.3
+velopack==0.0.72
 setuptools==84.0.0
 waitress==3.0.2
 Werkzeug==3.1.8

@@ -1,4 +1,4 @@
-name: Build and Release Windows Service
+name: Build and Release Windows Setup
 
 on:
   push:
@@ -16,14 +16,14 @@ permissions:
   contents: write
 
 env:
-  APP_NAME: Odoo Printer
+  APP_ID: OdooPrinter
   APP_EXE: odoo-epos-bridge.exe
   SERVICE_NAME: OdooPrinter
   PYTHON_VERSION: "3.12"
 
 jobs:
   build:
-    name: Build Windows Service Package
+    name: Build Setup.exe + Velopack feed
     runs-on: windows-latest
 
     steps:
@@ -40,14 +40,15 @@ jobs:
           else {
             $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
           }
-
           if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
             Write-Error "Invalid version: $version"
             exit 1
           }
-
           "VERSION=$version" >> $env:GITHUB_OUTPUT
           Write-Host "Building version $version"
+          # Single source of truth for the bridge --version + installer name.
+          (Get-Content version.py) -replace '__version__ = ".*"', "__version__ = `"$version`"" | Set-Content version.py
+          Get-Content version.py
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,99 +60,99 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          if (Test-Path "requirements.txt") {
-            python -m pip install -r requirements.txt
-          }
-          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
 
-      - name: Build EXE
+      - name: Run tests
         shell: pwsh
         run: |
-          if (Test-Path "main.spec") {
-            pyinstaller --clean --noconfirm main.spec
-          }
-          else {
-            pyinstaller --clean --noconfirm --onefile --console --name "odoo-epos-bridge" main.py
-          }
+          $env:ODOO_PRINTER_NO_UPDATE = "1"
+          python -m pytest -q
 
-      - name: Verify EXE
+      - name: Build onedir EXE (Velopack-compatible)
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse | Select-Object -First 1
+          python installer/make_version_info.py
+          pyinstaller --clean --noconfirm main.spec
+          Get-ChildItem dist/odoo-epos-bridge/odoo-epos-bridge.exe
 
-          if (-not $exe) {
-            Write-Error "No EXE was produced in dist/"
-            exit 1
+      - name: Optional code signing (self-signed PFX in secrets)
+        shell: pwsh
+        env:
+          SIGN_PFX_B64: ${{ secrets.WINDOWS_SIGN_PFX_B64 }}
+          SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGN_PFX_B64)) {
+            Write-Host "No signing cert configured, skipping (unsigned test build)."
+            exit 0
           }
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:SIGN_PFX_B64))
+          & signtool sign /f cert.pfx /p $env:SIGN_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 `
+            dist/odoo-epos-bridge/odoo-epos-bridge.exe
+          Remove-Item cert.pfx -Force
 
-          Write-Host "Found EXE: $($exe.FullName)"
+      - name: Install Velopack + Inno Setup
+        shell: pwsh
+        run: |
+          dotnet tool install -g vpk
+          choco install innosetup -y
 
-      - name: Prepare Windows service package
+      - name: Velopack pack (auto-update feed)
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          $packageDir = "service-package"
-          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          vpk pack --packId $env:APP_ID --packVersion $env:VERSION `
+            --packDir dist/odoo-epos-bridge --mainExe $env:APP_EXE
+          Get-ChildItem Releases/*
 
-          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" -Recurse | Select-Object -First 1
-          if (-not $exe) {
-            Write-Error "Could not find the built EXE."
-            exit 1
-          }
+      - name: Fetch nssm.exe for the installer payload
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile nssm.zip
+          Expand-Archive nssm.zip nssm_extract -Force
+          $exe = Get-ChildItem nssm_extract -Recurse -Filter nssm.exe | Select-Object -First 1
+          Copy-Item $exe.FullName installer/nssm.exe -Force
 
-          Copy-Item $exe.FullName "$packageDir\${{ env.APP_EXE }}" -Force
-          Copy-Item "install_windows_service.ps1" "$packageDir\install_windows_service.ps1" -Force
+      - name: Build Setup.exe with Inno
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/odoo-printer.iss /DVersion=$env:VERSION
+          Get-ChildItem Output/*
 
-          if (Test-Path "README.md") {
-            Copy-Item "README.md" "$packageDir\README.md" -Force
-          }
+      - name: Sign Setup.exe (if cert configured)
+        shell: pwsh
+        env:
+          SIGN_PFX_B64: ${{ secrets.WINDOWS_SIGN_PFX_B64 }}
+          SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGN_PFX_B64)) { exit 0 }
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:SIGN_PFX_B64))
+          & signtool sign /f cert.pfx /p $env:SIGN_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 `
+            Output/OdooPrinter-Setup-$env:VERSION.exe
+          Remove-Item cert.pfx -Force
 
-          $nssmZip = Join-Path $packageDir "nssm.zip"
-          Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip
-
-          Expand-Archive -Path $nssmZip -DestinationPath "$packageDir\nssm" -Force
-          $nssmExe = Get-ChildItem -Path "$packageDir\nssm" -Recurse -Filter "nssm.exe" | Select-Object -First 1
-
-          if (-not $nssmExe) {
-            Write-Error "nssm.exe was not found in the downloaded archive."
-            exit 1
-          }
-
-          Copy-Item $nssmExe.FullName "$packageDir\nssm.exe" -Force
-
-          @"
-          Windows service package for Odoo Printer
-
-          1. Copy the ZIP to the target Windows machine.
-          2. Extract it.
-          3. Run PowerShell as Administrator.
-          4. Execute:
-             .\install_windows_service.ps1
-
-          The service uses NSSM to run the bundled EXE in the background.
-          "@ | Out-File "$packageDir\INSTALL.txt" -Encoding ascii
-
-          $zipPath = "odoo-printer-windows-$env:VERSION.zip"
-          Compress-Archive -Path "$packageDir\*" -DestinationPath $zipPath -Force
-
-          Write-Host "Created release bundle: $zipPath"
-
-      - name: Upload service bundle artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OdooPrinter-Windows-Service-${{ steps.version.outputs.VERSION }}
+          name: OdooPrinter-${{ steps.version.outputs.VERSION }}
           path: |
-            odoo-printer-windows-${{ steps.version.outputs.VERSION }}.zip
+            Output/OdooPrinter-Setup-*.exe
+            Releases/*
           if-no-files-found: error
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.VERSION }}
-          name: Odoo Printer v${{ steps.version.outputs.VERSION }}
+          name: OdooPrinter v${{ steps.version.outputs.VERSION }}
           generate_release_notes: true
           files: |
-            odoo-printer-windows-${{ steps.version.outputs.VERSION }}.zip
+            Output/OdooPrinter-Setup-*.exe
+            Releases/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -117,6 +117,14 @@ def response_code(body: bytes) -> str | None:
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def neutral_scaling(monkeypatch):
+    """Deterministic raster pipeline: tests assume no scaling."""
+    monkeypatch.setattr(main, "RASTER_SCALE_X", 1.0)
+    monkeypatch.setattr(main, "RASTER_SCALE_Y", 1.0)
+    monkeypatch.setattr(main, "END_BLANK_LINES", 2)
+
+
 @pytest.fixture()
 def app():
     """Flask application with TESTING enabled."""

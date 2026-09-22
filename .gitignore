@@ -1,10 +1,15 @@
 venv/
 .venv/
 *.pem
+*.pfx
 __pycache__/
 .pytest_cache/
 build/
 dist/
+Output/
+Releases/
+installer/nssm.exe
+version_info.txt
 *.spec.lock
 
 

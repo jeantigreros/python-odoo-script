@@ -41,7 +41,11 @@ def test_image_plus_cut_orders_raster_before_cut(printer_width):
     )
     out = main.translate_epos_to_escpos(xml)
 
-    expected = expected_image_bytes() + main.build_cut_command()
+    expected = (
+        expected_image_bytes()
+        + b"\x0A" * main.END_BLANK_LINES
+        + main.build_cut_command()
+    )
     assert out == expected
     # GS v 0 — raster bit image comes first...
     assert out.startswith(b"\x1D\x76\x30")
@@ -76,6 +80,7 @@ def test_image_pulse_cut_appear_in_order(printer_width):
     expected = (
         expected_image_bytes()
         + main.build_cash_drawer_command()
+        + b"\x0A" * main.END_BLANK_LINES
         + main.build_cut_command()
     )
     assert out == expected
@@ -84,7 +89,9 @@ def test_image_pulse_cut_appear_in_order(printer_width):
     drawer_end = raster_end + len(main.build_cash_drawer_command())
     assert out[:raster_end].startswith(b"\x1D\x76\x30")  # raster first.
     assert out[raster_end:drawer_end] == b"\x1B\x70\x00\x19\xFA"  # drawer.
-    assert out[drawer_end:] == b"\x1D\x56\x00"  # cut last.
+    assert out[drawer_end:] == (
+        b"\x0A" * main.END_BLANK_LINES + b"\x1D\x56\x00"
+    )  # feed + cut last.
 
 
 def test_namespaced_translation_matches_plain(printer_width):
@@ -150,7 +157,11 @@ def test_realistic_receipt_fixture_end_to_end(printer_width, receipt_xml_bytes):
     # Pipeline property 4: payload length matches 72 bytes x 4 rows.
     raster_section = out[:8 + 72 * 4]
     assert len(raster_section) == 8 + 288
-    assert out == raster_section + main.build_cut_command()
+    assert out == (
+        raster_section
+        + b"\x0A" * main.END_BLANK_LINES
+        + main.build_cut_command()
+    )
 
     # Pipeline property 5: left padding is white (zeros), original row0
     # was solid black (0xFF...), so it must appear after 12 zero bytes.

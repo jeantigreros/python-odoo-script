@@ -1,4 +1,4 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 from waitress import serve
 from flask_cors import CORS
 import base64
@@ -8,7 +8,16 @@ import logging
 import multiprocessing
 import os
 import threading
+import time
 import xml.etree.ElementTree as ET
+
+from config import BridgeConfig, load_config
+from version import __version__
+
+try:
+    import velopack
+except ImportError:  # dev/CI without velopack: updater disabled, app still runs.
+    velopack = None  # type: ignore[assignment]
 
 try:
     import win32print
@@ -17,14 +26,18 @@ except ImportError:  # Linux/CI: allow import; print_raw() raises a clear error.
 
 
 # ------------------------------------------------------------
-# Configuration
+# Configuration (config.ini in %ProgramData% survives updates)
 # ------------------------------------------------------------
 
-HOST = "192.168.18.92"
-PORT = 5000
+CONFIG: BridgeConfig = load_config()
+
+HOST = CONFIG.host
+PORT = CONFIG.port
 
 
 def _default_printer_name():
+    if CONFIG.printer_name:
+        return CONFIG.printer_name
     for env_key in ("POS_PRINTER_NAME", "POS-80"):
         value = os.getenv(env_key)
         if value:
@@ -42,6 +55,22 @@ def _default_printer_name():
 PRINTER_NAME = _default_printer_name()
 
 
+def reload_config(path=None):
+    """Re-read config.ini into module globals (used at startup/tests)."""
+    global CONFIG, HOST, PORT, PRINTER_NAME
+    global PRINTER_WIDTH_DOTS, RASTER_SCALE_X, RASTER_SCALE_Y
+    global END_BLANK_LINES
+    CONFIG = load_config(path)
+    HOST = CONFIG.host
+    PORT = CONFIG.port
+    PRINTER_NAME = CONFIG.printer_name or _default_printer_name()
+    PRINTER_WIDTH_DOTS = CONFIG.printer_width_dots
+    RASTER_SCALE_X = CONFIG.raster_scale_x
+    RASTER_SCALE_Y = CONFIG.raster_scale_y
+    END_BLANK_LINES = CONFIG.end_blank_lines
+    return CONFIG
+
+
 # ------------------------------------------------------------
 # Printer configuration
 # ------------------------------------------------------------
@@ -51,9 +80,7 @@ PRINTER_NAME = _default_printer_name()
 #   384 -> ~58 mm class printers
 #   576 -> ~80 mm class printers
 #
-PRINTER_WIDTH_DOTS = int(
-    os.getenv("POS_PRINTER_WIDTH_DOTS", "576")
-)
+PRINTER_WIDTH_DOTS = CONFIG.printer_width_dots
 
 
 # Odoo sends align="center".
@@ -80,19 +107,13 @@ CENTER_IMAGES = True
 #
 # Default: 1.20
 #
-RASTER_SCALE_X = float(
-    os.getenv("POS_RASTER_SCALE_X", "1.0")
-)
+RASTER_SCALE_X = CONFIG.raster_scale_x
 
-RASTER_SCALE_Y = float(
-    os.getenv("POS_RASTER_SCALE_Y", "1.50")
-)
+RASTER_SCALE_Y = CONFIG.raster_scale_y
 
 
 # Number of blank lines before cutting.
-END_BLANK_LINES = int(
-    os.getenv("POS_END_BLANK_LINES", "2")
-)
+END_BLANK_LINES = CONFIG.end_blank_lines
 
 
 # ------------------------------------------------------------
@@ -100,6 +121,77 @@ END_BLANK_LINES = int(
 # ------------------------------------------------------------
 
 printer_lock = threading.Lock()
+
+
+# ------------------------------------------------------------
+# Silent auto-updater (Velopack)
+# ------------------------------------------------------------
+
+def handle_velopack_hooks():
+    """Let Velopack handle install/update hooks first (may exit early)."""
+    if velopack is None:
+        return
+    try:
+        velopack.App().run()
+    except Exception:
+        logger.exception("Velopack hook failed")
+
+
+def check_for_updates_once(source_url=None, apply="wait"):
+    """Check/download/apply one update cycle. Silent, never raises.
+
+    apply: 'wait' -> WaitExitThenApplyUpdates (service-friendly),
+           'restart' -> ApplyUpdatesAndRestart, 'download' -> only download.
+    Returns True if an update was applied/downloaded.
+    """
+    if velopack is None:
+        return False
+    url = source_url or CONFIG.update_url
+    if not url:
+        return False
+    try:
+        mgr = velopack.UpdateManager(url)
+        info = mgr.check_for_updates()
+        if info is None:
+            return False
+        logger.info("Update found: %s, downloading...", info.TargetFullRelease)
+        mgr.download_updates(info)
+        if apply == "restart":
+            mgr.apply_updates_and_restart(info)
+        elif apply == "wait":
+            try:
+                mgr.wait_exit_then_apply_updates()
+            except AttributeError:
+                mgr.apply_updates_and_exit(info)
+        logger.info("Update downloaded, will apply on restart")
+        return True
+    except Exception:
+        logger.exception("Silent update check failed")
+        return False
+
+
+def start_update_checker(interval_hours=None, delay_first_seconds=60):
+    """Background daemon thread: check at startup (delayed) + every N hours."""
+    interval = (
+        interval_hours
+        if interval_hours is not None
+        else CONFIG.update_interval_hours
+    )
+    if interval <= 0:
+        return None
+
+    def _loop():
+        time.sleep(delay_first_seconds)
+        while True:
+            try:
+                check_for_updates_once(apply="wait")
+            except Exception:
+                logger.exception("Updater loop failed")
+            time.sleep(interval * 3600)
+
+    thread = threading.Thread(target=_loop, name="velopack-updater", daemon=True)
+    thread.start()
+    return thread
 
 
 # ------------------------------------------------------------
@@ -986,8 +1078,17 @@ def translate_epos_to_escpos(
 
 
 # ------------------------------------------------------------
-# Endpoint
+# Endpoints
 # ------------------------------------------------------------
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(
+        status="ok",
+        version=__version__,
+        printer=PRINTER_NAME,
+    )
+
 
 @app.route(
     "/cgi-bin/epos/service.cgi",
@@ -1064,8 +1165,12 @@ def epos_service():
 
 def main():
 
+    handle_velopack_hooks()
+    reload_config()
+
     logger.info(
-        "Starting Odoo ePOS -> ESC/POS bridge"
+        "Starting Odoo ePOS -> ESC/POS bridge v%s",
+        __version__,
     )
 
     logger.info(
@@ -1104,6 +1209,10 @@ def main():
         "/cgi-bin/epos/service.cgi"
     )
 
+    logger.info("Update feed: %s", CONFIG.update_url)
+    if os.getenv("ODOO_PRINTER_NO_UPDATE") != "1":
+        start_update_checker()
+
     serve(
         app,
         host=HOST,
@@ -1116,4 +1225,12 @@ if __name__ == "__main__":
 
     multiprocessing.freeze_support()
 
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--version", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.version:
+        print(__version__)
+    else:
+        main()

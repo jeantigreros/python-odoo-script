@@ -1,58 +1,28 @@
-# Build Windows Service
+# Instalación Windows (setup.exe)
 
-`main.py` is ready to be packaged as a Windows service by NSSM. 71 tests pass.
+Ya no se instala a mano con `install_windows_service.ps1` (se conserva solo
+como referencia). El flujo actual es:
 
-## What was fixed in `main.py`
+1. Tag `git tag v1.0.1 && git push --tags` (o dispatch manual con versión).
+2. CI (`build-windows-exe.yml`): tests → PyInstaller **onedir** → `vpk pack`
+   (feed Velopack) → Inno Setup → `Output/OdooPrinter-Setup-1.0.1.exe` →
+   GitHub Release con `Setup.exe` + `Releases/*`.
+3. En el PC del cliente: ejecutar el `Setup.exe` **como administrador**.
+   El wizard pregunta **IP** (ej. `0.0.0.0` o `192.168.18.92`) y **nombre de
+   impresora** (ej. `POS-80`), escribe `%ProgramData%\OdooPrinter\config.ini`,
+   instala el servicio `OdooPrinter` con NSSM y lo arranca.
+4. Verificar: `http://<IP>:5000/health` → `{"status":"ok",...}`.
+5. Reconfigurar después: menú inicio → "Reconfigurar IP e impresora".
 
-- Removed `from app import app` (no such module, crashed on startup).
-- Now uses `serve(app, host=127.0.0.1, port=5000, threads=8)` instead of `app.run()`.
-- Added `multiprocessing.freeze_support()` + `main()` entry point for PyInstaller.
-- `win32print` import is now safe (clear error if run off-Windows); printer from `POS_PRINTER_NAME` env or Windows default.
+## Auto-updater silencioso
 
-## Files added
+El bridge lleva Velopack integrado (`main.py: check_for_updates_once`):
+check al minuto de arrancar + cada 4h contra `update_url` del config
+(por defecto, la Release de GitHub). Descarga silenciosa y aplica al
+reiniciar el servicio. La config vive en `%ProgramData%`, no se pierde.
 
-- `main.spec` — PyInstaller one-file build → `dist\odoo-epos-bridge.exe` (console kept for logs).
-- `build_windows.bat` — double-click build script.
-- `install_windows_service.ps1` — installs the EXE as a Windows service using NSSM.
-- `requirements.txt` — added `waitress`, `pywin32; sys_platform=="win32"`, `pyinstaller`.
-- `.github/workflows/build-windows-exe.yml` — builds a ZIP bundle with the EXE, NSSM, and installer script.
+## Firma (pruebas)
 
-## Build on Windows
-
-Must build on Windows — Linux can't cross-build a Windows `.exe`.
-
-```bat
-build_windows.bat
-```
-
-Or manually:
-
-```bat
-pip install -r requirements.txt
-pyinstaller --noconfirm main.spec
-dist\odoo-epos-bridge.exe
-```
-
-## Install as a Windows service with NSSM
-
-From a Windows machine with Administrator rights:
-
-```powershell
-.\install_windows_service.ps1 -ServiceName OdooPrinter -DisplayName "Odoo Printer"
-```
-
-This will:
-
-- find the bundled `odoo-epos-bridge.exe`
-- install it as an NSSM-managed service
-- start the service automatically
-
-## Configure
-
-```bat
-set POS_PRINTER_NAME=POS-80
-set POS_PRINTER_WIDTH_DOTS=576
-dist\odoo-epos-bridge.exe
-```
-
-Endpoint: `http://127.0.0.1:5000/cgi-bin/epos/service.cgi`
+Ver `installer/SIGNING.md`: self-signed con `signtool` + importar el PFX en
+`Cert:\LocalMachine\Root` de cada PC de prueba. Para producción, mismos pasos
+con Azure Trusted Signing o certificado OV vía secrets `WINDOWS_SIGN_PFX_B64`.
