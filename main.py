@@ -140,8 +140,10 @@ def handle_velopack_hooks():
 def check_for_updates_once(source_url=None, apply="wait"):
     """Check/download/apply one update cycle. Silent, never raises.
 
-    apply: 'wait' -> WaitExitThenApplyUpdates (service-friendly),
-           'restart' -> ApplyUpdatesAndRestart, 'download' -> only download.
+    apply: 'wait' -> apply on exit, NSSM restarts the service into the
+           new version (service-friendly default),
+           'restart' -> ApplyUpdatesAndRestart (console/dev runs),
+           'download' -> only download, apply on next restart.
     Returns True if an update was applied/downloaded.
     """
     if velopack is None:
@@ -154,15 +156,14 @@ def check_for_updates_once(source_url=None, apply="wait"):
         info = mgr.check_for_updates()
         if info is None:
             return False
-        logger.info("Update found: %s, downloading...", info.TargetFullRelease)
+        target = getattr(info.TargetFullRelease, "Version", info.TargetFullRelease)
+        logger.info("Update found: %s, downloading...", target)
         mgr.download_updates(info)
         if apply == "restart":
             mgr.apply_updates_and_restart(info)
         elif apply == "wait":
-            try:
-                mgr.wait_exit_then_apply_updates()
-            except AttributeError:
-                mgr.apply_updates_and_exit(info)
+            # Update.exe applies once we exit; NSSM restarts the service.
+            mgr.apply_updates_and_exit(info)
         logger.info("Update downloaded, will apply on restart")
         return True
     except Exception:
